@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [ main ]
+    branches: [ main, copilot/run-ci-workflow ]
   pull_request:
     branches: [ main ]
 # When a new revision is pushed to a PR, cancel all in-progress CI runs for that
