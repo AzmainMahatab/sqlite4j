@@ -49,7 +49,9 @@ public class WasmDB extends DB implements WasmDBImports {
     private final FileSystem fs;
     private final boolean isMemory;
 
-    /** SQLite connection handle. */
+    /**
+     * SQLite connection handle.
+     */
     private int dbPtrPtr = 0;
 
     private int dbPtr = 0;
@@ -286,7 +288,10 @@ public class WasmDB extends DB implements WasmDBImports {
             if (!filename.isEmpty() && Files.notExists(dest)) {
                 if (!Files.exists(origin) && (openFlags & SQLITE_OPEN_CREATE) != 0) {
                     try {
-                        Files.createDirectories(origin.getParent());
+                        Path parent = origin.getParent();
+                        if (parent != null) {
+                            Files.createDirectories(parent);
+                        }
                         Files.createFile(origin);
                     } catch (IOException e) {
                         SQLException msg =
@@ -783,7 +788,10 @@ public class WasmDB extends DB implements WasmDBImports {
         // TODO: verify why we need this dance around VFS
         Path dest = fs.getPath(destFileName);
         try {
-            Files.createDirectories(dest.getParent());
+            Path parent = dest.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
         } catch (FileAlreadyExistsException e) {
             // TODO: review carefully the rest of the usage of createDirectories
             // createDirectories is failing
