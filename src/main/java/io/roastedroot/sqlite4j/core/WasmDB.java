@@ -35,6 +35,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileSystem;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.sql.SQLException;
@@ -281,47 +282,88 @@ public class WasmDB extends DB implements WasmDBImports {
     @Override
     protected synchronized void _open(String filename, int openFlags) throws SQLException {
         if (!isMemory) {
-            Path origin = Path.of(filename);
-            Path dest = fs.getPath(filename);
-            if (!filename.isEmpty() && Files.notExists(dest)) {
-                if (!Files.exists(origin) && (openFlags & SQLITE_OPEN_CREATE) != 0) {
-                    try {
-                        Files.createDirectories(origin.getParent());
-                        Files.createFile(origin);
-                    } catch (IOException e) {
-                        SQLException msg =
+            try {
+                Path origin = Path.of(filename);
+                Path dest = fs.getPath(filename);
+
+                if (!filename.isEmpty() && Files.notExists(dest)) {
+                    boolean shouldCreate = (openFlags & SQLITE_OPEN_CREATE) != 0;
+                    boolean originExists = Files.exists(origin);
+
+                    if (!shouldCreate && !originExists) {
+                        Path parent = origin.getParent();
+                        if (parent != null && !Files.exists(parent)) {
+                            throw new SQLException(
+                                    DB.newSQLException(
+                                                    SQLITE_CANTOPEN,
+                                                    "Cannot open database, directory does not"
+                                                            + " exist: "
+                                                            + filename)
+                                            .getMessage());
+                        }
+                    }
+
+                    if (!originExists && shouldCreate) {
+                        try {
+                            Path parent = origin.getParent();
+                            if (parent != null) {
+                                Files.createDirectories(parent);
+                            }
+                            Files.createFile(origin);
+                        } catch (IOException e) {
+                            throw new SQLException(
+                                    DB.newSQLException(
+                                                    SQLITE_CANTOPEN,
+                                                    "Failed to create db file: " + filename)
+                                            .getMessage(),
+                                    e);
+                        }
+                    }
+
+                    if (Files.exists(origin)) {
+                        try (InputStream is = new FileInputStream(filename)) {
+                            Path destParent = dest.getParent();
+                            if (destParent != null) {
+                                Files.createDirectories(destParent);
+                            }
+                            Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
+                            Files.setOwner(dest, Files.getOwner(origin));
+                            try {
+                                if (origin.getFileSystem()
+                                        .supportedFileAttributeViews()
+                                        .contains("posix")) {
+                                    Files.setPosixFilePermissions(
+                                            dest, Files.getPosixFilePermissions(origin));
+                                }
+                            } catch (UnsupportedOperationException e) {
+                                // Windows doesn't support POSIX permissions
+                            }
+                        } catch (IOException e) {
+                            throw new SQLException(
+                                    DB.newSQLException(
+                                                    SQLITE_CANTOPEN,
+                                                    "Failed to map to memory the file: " + filename)
+                                            .getMessage(),
+                                    e);
+                        }
+                    } else if (!shouldCreate) {
+                        throw new SQLException(
                                 DB.newSQLException(
-                                        SQLITE_CANTOPEN, "Failed to create db file: " + filename);
-                        throw new SQLException(msg.getMessage(), e);
+                                                SQLITE_CANTOPEN,
+                                                "Database file doesn't exists: " + filename)
+                                        .getMessage());
                     }
                 }
-                if (Files.exists(origin)) {
-                    try (InputStream is = new FileInputStream(filename)) {
-                        Files.createDirectories(dest);
-                        java.nio.file.Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
-                        var owner = Files.getOwner(origin);
-                        Files.setOwner(dest, owner);
-                        var permissions = Files.getPosixFilePermissions(origin);
-                        Files.setPosixFilePermissions(dest, permissions);
-                    } catch (IOException e) {
-                        SQLException msg =
-                                DB.newSQLException(
-                                        SQLITE_CANTOPEN,
-                                        "Failed to map to memory the file: " + filename);
-                        throw new SQLException(msg.getMessage(), e);
-                    }
-                } else {
-                    SQLException msg =
-                            DB.newSQLException(
-                                    SQLITE_CANTOPEN, "Database file doesn't exists: " + filename);
-                    throw new SQLException(msg.getMessage());
-                }
+            } catch (InvalidPathException e) {
+                throw new SQLException(
+                        DB.newSQLException(SQLITE_CANTOPEN, "Invalid database path: " + filename)
+                                .getMessage(),
+                        e);
             }
         }
 
         this.dbPtrPtr = lib.malloc(PTR_SIZE);
         int dbNamePtr = lib.allocCString(filename);
-
         int res = lib.openV2(dbNamePtr, dbPtrPtr, openFlags, 0);
         this.dbPtr = instance.memory().readInt(this.dbPtrPtr);
         if (res != SQLITE_OK) {
@@ -329,7 +371,6 @@ public class WasmDB extends DB implements WasmDBImports {
             lib.close(dbPtr());
             throw DB.newSQLException(errCode, errmsg());
         }
-        // exports.free(dbNamePtr);
     }
 
     @Override
@@ -774,26 +815,20 @@ public class WasmDB extends DB implements WasmDBImports {
         int destNamePtr = lib.allocCString(destFileName);
         int mainStrPtr = lib.allocCString("main");
         int destDbPtr = lib.malloc(PTR_SIZE);
-
         int flags = SQLITE_OPEN_READWRITE + SQLITE_OPEN_CREATE;
         if (destFileName.startsWith("file:")) {
             flags += SQLITE_OPEN_URI;
         }
 
-        // TODO: verify why we need this dance around VFS
         Path dest = fs.getPath(destFileName);
         try {
-            Files.createDirectories(dest.getParent());
-        } catch (FileAlreadyExistsException e) {
-            // TODO: review carefully the rest of the usage of createDirectories
-            // createDirectories is failing
-        } catch (IOException e) {
-            throw new SQLiteException(
-                    "failed to map to in-memory VFS " + e.getMessage(),
-                    SQLiteErrorCode.SQLITE_ERROR);
-        }
-        try {
+            Path parent = dest.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
             Files.deleteIfExists(dest);
+        } catch (FileAlreadyExistsException e) {
+            // Ignore - directory already exists
         } catch (IOException e) {
             throw new SQLiteException(
                     "failed to map to in-memory VFS " + e.getMessage(),
@@ -806,14 +841,9 @@ public class WasmDB extends DB implements WasmDBImports {
             int pBackup = lib.backupInit(lib.ptr(destDbPtr), mainStrPtr, dbPtr(), originNamePtr);
             do {
                 rc = lib.backupStep(pBackup, pagesPerStep);
-
-                // if the step completed successfully, update progress
                 if (observer != null && (rc == SQLITE_OK || rc == SQLITE_DONE)) {
-                    int remaining = lib.backupRemaining(pBackup);
-                    int pageCount = lib.backupPageCount(pBackup);
-                    observer.progress(remaining, pageCount);
+                    observer.progress(lib.backupRemaining(pBackup), lib.backupPageCount(pBackup));
                 }
-
                 if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
                     if (nTimeout++ >= nTimeoutLimit) {
                         break;
@@ -821,25 +851,32 @@ public class WasmDB extends DB implements WasmDBImports {
                     lib.sleep(sleepTimeMillis);
                 }
             } while (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
-
             lib.backupFinish(pBackup);
             rc = lib.extendedErrorcode(lib.ptr(destDbPtr));
         }
-
         lib.free(originNamePtr);
         lib.free(destNamePtr);
         lib.free(destDbPtr);
         lib.free(mainStrPtr);
 
-        // and now copy the backup file from the VFS to the real disk
-        Path realDiskDest = Path.of(destFileName);
+        // Copy backup file from VFS to real disk
         try {
-            java.nio.file.Files.copy(dest, realDiskDest, StandardCopyOption.REPLACE_EXISTING);
-            Files.deleteIfExists(dest);
+            Path realDiskDest = Path.of(destFileName).toAbsolutePath().normalize();
+            if (!dest.toAbsolutePath().normalize().equals(realDiskDest)) {
+                Path parentDir = realDiskDest.getParent();
+                if (parentDir != null) {
+                    Files.createDirectories(parentDir);
+                }
+                Files.copy(dest, realDiskDest, StandardCopyOption.REPLACE_EXISTING);
+                Files.deleteIfExists(dest);
+            }
+        } catch (InvalidPathException e) {
+            throw new SQLiteException(
+                    "Invalid backup destination path: " + destFileName,
+                    SQLiteErrorCode.SQLITE_ERROR);
         } catch (IOException e) {
             throw new SQLiteException(
-                    "failed to map to in-memory VFS " + e.getMessage(),
-                    SQLiteErrorCode.SQLITE_ERROR);
+                    "Failed to copy backup to disk: " + destFileName, SQLiteErrorCode.SQLITE_ERROR);
         }
         return rc;
     }
@@ -880,7 +917,7 @@ public class WasmDB extends DB implements WasmDBImports {
         Path source = fs.getPath(sourceFileName);
         try {
             Files.createDirectories(source);
-            java.nio.file.Files.copy(realDiskSource, source, StandardCopyOption.REPLACE_EXISTING);
+            Files.copy(realDiskSource, source, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
             throw new SQLiteException(
                     "failed to map to in-memory VFS " + e.getMessage(),
