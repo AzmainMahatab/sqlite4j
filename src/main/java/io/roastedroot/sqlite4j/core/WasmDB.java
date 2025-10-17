@@ -49,9 +49,7 @@ public class WasmDB extends DB implements WasmDBImports {
     private final FileSystem fs;
     private final boolean isMemory;
 
-    /**
-     * SQLite connection handle.
-     */
+    /** SQLite connection handle. */
     private int dbPtrPtr = 0;
 
     private int dbPtr = 0;
